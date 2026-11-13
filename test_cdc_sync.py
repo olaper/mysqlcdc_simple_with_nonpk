@@ -1,6 +1,9 @@
+import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 # Tests never use local credentials or connect to a database.
 with patch.dict(os.environ, {
@@ -17,6 +20,66 @@ with patch.dict(os.environ, {
     import cdc_sync as cdc
 
 
+class SaveStateTests(unittest.TestCase):
+    def test_create_and_replace_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            with patch.object(cdc, "STATE_FILE", str(state)):
+                for pos in (4, 100):
+                    cdc.save_state("bin.000001", pos)
+                    self.assertEqual(json.loads(state.read_text()),
+                                     {"file": "bin.000001", "pos": pos})
+                    self.assertFalse(Path(str(state) + ".tmp").exists())
+
+    def test_transient_permission_error_retries_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text('{"file": "bin.000001", "pos": 4}')
+            with patch.object(cdc, "STATE_FILE", str(state)), \
+                    patch.object(cdc.os, "replace", wraps=os.replace,
+                                 side_effect=[PermissionError("locked"), DEFAULT]) as replace, \
+                    patch.object(cdc.time, "sleep") as sleep, \
+                    patch("builtins.print") as warning:
+                cdc.save_state("bin.000001", 100)
+            self.assertEqual(replace.call_count, 2)
+            sleep.assert_called_once_with(0.1)
+            warning.assert_called_once()
+            self.assertEqual(json.loads(state.read_text()),
+                             {"file": "bin.000001", "pos": 100})
+            self.assertFalse(Path(str(state) + ".tmp").exists())
+
+    def test_persistent_permission_error_preserves_checkpoint_and_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            original = '{"file": "bin.000001", "pos": 4}'
+            state.write_text(original)
+            error = PermissionError("locked")
+            with patch.object(cdc, "STATE_FILE", str(state)), \
+                    patch.object(cdc.os, "replace", side_effect=error) as replace, \
+                    patch.object(cdc.time, "sleep") as sleep, \
+                    patch("builtins.print"):
+                with self.assertRaisesRegex(PermissionError, "checkpoint was not advanced") as raised:
+                    cdc.save_state("bin.000001", 100)
+            self.assertIs(raised.exception.__cause__, error)
+            self.assertEqual(replace.call_count, 5)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list],
+                             [0.1, 0.2, 0.4, 0.8])
+            self.assertEqual(state.read_text(), original)
+            self.assertEqual(json.loads(Path(str(state) + ".tmp").read_text()),
+                             {"file": "bin.000001", "pos": 100})
+
+    def test_other_os_errors_are_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            with patch.object(cdc, "STATE_FILE", str(state)), \
+                    patch.object(cdc.os, "replace", side_effect=OSError("disk error")) as replace, \
+                    patch.object(cdc.time, "sleep") as sleep:
+                with self.assertRaisesRegex(OSError, "disk error"):
+                    cdc.save_state("bin.000001", 100)
+            replace.assert_called_once()
+            sleep.assert_not_called()
+
+
 class ApplyEventTests(unittest.TestCase):
     def test_insert_and_replay_for_all_key_types(self):
         examples = {
@@ -24,6 +87,7 @@ class ApplyEventTests(unittest.TestCase):
             "orders": {"order_no": "O1001", "amount": 10},
             "product": {"product_id": 101, "name": "Keyboard"},
             "order_item": {"order_id": 1001, "line_no": 1, "quantity": 2},
+            "activity_log": {"my_row_id": 7, "event_type": "LOGIN", "details": "Signed in"},
         }
         for table, values in examples.items():
             with self.subTest(table=table):
@@ -44,6 +108,8 @@ class ApplyEventTests(unittest.TestCase):
 
     def test_update_uses_old_single_or_composite_key(self):
         examples = [
+            ("activity_log", {"my_row_id": 7, "details": "Signed in"},
+             {"my_row_id": 7, "details": "Session started"}, "`my_row_id`=%s", [7]),
             ("customer", {"customer_no": "C001", "name": "Alice"},
              {"customer_no": "C001X", "name": "Alice"}, "`customer_no`=%s", ["C001"]),
             ("orders", {"order_no": "O1001", "amount": 10},
@@ -66,6 +132,7 @@ class ApplyEventTests(unittest.TestCase):
 
     def test_delete_uses_only_configured_key(self):
         examples = [
+            ("activity_log", {"my_row_id": 7, "event_type": "LOGIN"}, "`my_row_id`=%s", [7]),
             ("customer", {"customer_no": "C001", "name": "Alice"}, "`customer_no`=%s", ["C001"]),
             ("orders", {"order_no": "O1001", "amount": 10}, "`order_no`=%s", ["O1001"]),
             ("product", {"product_id": 101, "name": "Keyboard"}, "`product_id`=%s", [101]),
@@ -117,7 +184,7 @@ class ApplyEventTests(unittest.TestCase):
                 patch.object(cdc.pymysql, "connect", return_value=dst):
             cdc.main()
         self.assertEqual(set(reader.call_args.kwargs["only_tables"]),
-                         {"customer", "orders", "product", "order_item"})
+                         {"customer", "orders", "product", "order_item", "activity_log"})
         stream.close.assert_called_once()
         dst.close.assert_called_once()
 

@@ -21,6 +21,7 @@ See samplescript.sql for setup and mixed-table INSERT/UPDATE/DELETE tests.
 """
 import json
 import os
+import time
 from pathlib import Path
 
 import certifi
@@ -66,6 +67,7 @@ SSL = {"ca": certifi.where()}
 PRIMARY_KEY = {
     "product": ("product_id",),
     "order_item": ("order_id", "line_no"),
+    "activity_log": ("my_row_id",),
 }
 UNIQUE_KEY = {
     "customer": ("customer_no",),
@@ -100,7 +102,23 @@ def save_state(file, pos):
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"file": file, "pos": pos}, f)
-    os.replace(tmp, STATE_FILE)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, STATE_FILE)
+            return
+        except PermissionError as exc:
+            if attempt == 4:
+                raise PermissionError(
+                    f"Cannot replace checkpoint {os.path.abspath(STATE_FILE)} after 5 attempts. "
+                    "Check file/directory permissions, read-only attributes, and file locks; "
+                    "run only one CDC instance per checkpoint. "
+                    f"The target change was already committed; checkpoint was not advanced. "
+                    f"Keep the existing checkpoint and {os.path.abspath(tmp)} for diagnosis. "
+                    "Restarting may replay committed events."
+                ) from exc
+            delay = 0.1 * (2 ** attempt)
+            print(f"WARNING: checkpoint replacement denied; retrying in {delay:.1f}s: {exc}")
+            time.sleep(delay)
 
 
 def quote_identifier(name):

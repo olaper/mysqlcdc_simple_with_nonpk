@@ -2,6 +2,7 @@
 -- Mixed-key CDC test script. Matches the explicit keys in cdc_sync.py:
 --   PRIMARY_KEY: product(product_id), order_item(order_id, line_no)
 --   UNIQUE_KEY (no PK): customer(customer_no), orders(order_no)
+--   GIPK (no declared PK or UNIQUE KEY): activity_log(my_row_id)
 -- Execute each STEP separately, NOT the entire file in one run.
 -- =====================================================================
 
@@ -12,8 +13,9 @@
 --   target: gphingreen-poc.mysql.database.azure.com
 --   Note: if you get "unable to create a table without a primary key",
 --   set the server parameter sql_require_primary_key = OFF.
---   MySQL 8.0.30+: disable sql_generate_invisible_primary_key if enabled,
---   otherwise the "no PK" tables may receive an invisible generated PK.
+--   Requires MySQL 8.0.30+ for the GIPK example. Session GIPK generation
+--   is disabled for the original tables, enabled only for activity_log,
+--   then restored. Run STEP 1 in the same connection on each server.
 --   Source must use binlog_format=ROW and binlog_row_image=FULL.
 --   WARNING: this step DROPS sample tables and their existing data.
 --   Stop CDC before setup. Use a fresh checkpoint for a new empty-table test;
@@ -22,6 +24,9 @@
 -- ---------------------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS ghbin_sampledb2;
 USE ghbin_sampledb2;
+
+SET @saved_sql_generate_invisible_primary_key = @@SESSION.sql_generate_invisible_primary_key;
+SET SESSION sql_generate_invisible_primary_key = OFF;
 
 DROP TABLE IF EXISTS customer;
 CREATE TABLE customer (
@@ -60,11 +65,25 @@ CREATE TABLE order_item (
     PRIMARY KEY (order_id, line_no)
 );
 
--- Confirm PRIMARY appears only for product and order_item.
+-- MySQL adds my_row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT INVISIBLE
+-- and PRIMARY KEY (my_row_id); neither is declared in this table definition.
+SET SESSION sql_generate_invisible_primary_key = ON;
+DROP TABLE IF EXISTS activity_log;
+CREATE TABLE activity_log (
+    event_type   VARCHAR(30)  NOT NULL,
+    details      VARCHAR(200) NOT NULL
+) ENGINE=InnoDB;
+SET SESSION sql_generate_invisible_primary_key = @saved_sql_generate_invisible_primary_key;
+
+-- Confirm PRIMARY appears for product, order_item, and activity_log only.
+-- Enable GIPK metadata display in this session if it has been disabled.
+SET SESSION show_gipk_in_create_table_and_information_schema = ON;
 SHOW INDEX FROM customer;
 SHOW INDEX FROM orders;
 SHOW INDEX FROM product;
 SHOW INDEX FROM order_item;
+SHOW INDEX FROM activity_log;
+SHOW CREATE TABLE activity_log;
 
 
 -- ---------------------------------------------------------------------
@@ -91,6 +110,11 @@ INSERT INTO order_item (order_id, line_no, product_id, quantity) VALUES
     (1001, 2, 102, 1),
     (1002, 1, 102, 3);
 
+-- Omit the invisible column: MySQL generates it; CDC copies its source value.
+INSERT INTO activity_log (event_type, details) VALUES
+    ('LOGIN', 'Signed in'),
+    ('LOGOUT', 'Signed out');
+
 
 -- ---------------------------------------------------------------------
 -- STEP 3. Generate changes  (run on SOURCE while cdc_sync.py is running)
@@ -109,11 +133,15 @@ VALUES (103, 'Temporary product', 10.00);
 INSERT INTO order_item (order_id, line_no, product_id, quantity)
 VALUES (1003, 1, 103, 1);
 
+INSERT INTO activity_log (event_type, details)
+VALUES ('LOGIN', 'Temporary event');
+
 -- 3-2. UPDATE (normal column)
 UPDATE customer SET grade = 'PLATINUM' WHERE customer_no = 'C001';
 UPDATE orders   SET status = 'PAID', amount = 160.00 WHERE order_no = 'O1001';
 UPDATE product SET price = 55.00 WHERE product_id = 101;
 UPDATE order_item SET quantity = 4 WHERE order_id = 1001 AND line_no = 1;
+UPDATE activity_log SET details = 'Session started' WHERE details = 'Signed in';
 
 -- 3-3. UPDATE of the unique column itself (the script uses the "before" value to find the row)
 UPDATE customer SET customer_no = 'C002X' WHERE customer_no = 'C002';
@@ -132,6 +160,7 @@ DELETE FROM orders   WHERE order_no = 'O1003';
 DELETE FROM customer WHERE customer_no = 'C003';
 DELETE FROM order_item WHERE order_id = 1003 AND line_no = 1;
 DELETE FROM product WHERE product_id = 103;
+DELETE FROM activity_log WHERE details = 'Temporary event';
 
 -- No FKs are defined: changing a customer/product key does not cascade
 -- to orders/order_item; the same independent row images are copied to target.
@@ -139,24 +168,29 @@ DELETE FROM product WHERE product_id = 103;
 
 -- ---------------------------------------------------------------------
 -- STEP 4. Verify (after CDC catches up, run on BOTH servers).
---   Full row results should match. Expected counts: 2, 2, 2, 3.
+--   Full row results should match. Expected counts: 2, 2, 2, 3, 2.
 -- ---------------------------------------------------------------------
 SELECT * FROM customer ORDER BY customer_no;
 SELECT * FROM orders   ORDER BY order_no;
 SELECT * FROM product ORDER BY product_id;
 SELECT * FROM order_item ORDER BY order_id, line_no;
+-- SELECT * alone omits the invisible GIPK column.
+SELECT my_row_id, activity_log.* FROM activity_log ORDER BY my_row_id;
 
 -- Quick count / checksum comparison
 SELECT COUNT(*) AS cnt FROM customer;
 SELECT COUNT(*) AS cnt FROM orders;
 SELECT COUNT(*) AS cnt FROM product;
 SELECT COUNT(*) AS cnt FROM order_item;
-CHECKSUM TABLE customer, orders, product, order_item;
+SELECT COUNT(*) AS cnt FROM activity_log;
+CHECKSUM TABLE customer, orders, product, order_item, activity_log;
 
 -- Expected product IDs: 101, 202; product 101 price: 55.00.
 -- Expected order_item keys/quantities: (1001,1)=5, (1001,3)=2, (1002,1)=3.
 -- Expected customer keys: C001, C002X; C001 grade: PLATINUM.
 -- Expected order keys: O1001, O1002X; both status: SHIPPED.
+-- Expected activity_log: LOGIN/'Session started', LOGOUT/'Signed out';
+-- my_row_id values must match between source and target.
 
 
 -- ---------------------------------------------------------------------

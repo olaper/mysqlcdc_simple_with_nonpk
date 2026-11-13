@@ -12,6 +12,7 @@ The sample mixes tables with and without primary keys:
 | `order_item` | Composite primary key: `order_id`, `line_no` |
 | `customer` | No PK; UNIQUE KEY: `customer_no` |
 | `orders` | No PK; UNIQUE KEY: `order_no` |
+| `activity_log` | No declared PK or UNIQUE KEY; MySQL generates invisible PK `my_row_id` |
 
 Keys are explicitly configured in `PRIMARY_KEY` and `UNIQUE_KEY` in the script,
 not detected automatically. UPDATE and DELETE locate rows using these keys;
@@ -28,8 +29,14 @@ UPDATE uses the old key when a key value changes. INSERT uses an upsert.
 - Identical source/target table definitions. Non-PK key columns must be
   `NOT NULL` and covered by a UNIQUE index.
 - For the no-PK tables, set `sql_require_primary_key=OFF` on both servers.
-  On versions supporting it, disable `sql_generate_invisible_primary_key`
-  so these tables do not receive an automatically generated PK.
+- MySQL 8.0.30+ on both servers for Generated Invisible Primary Keys (GIPK).
+  Setup disables session `sql_generate_invisible_primary_key` for the original
+  tables, enables it only when creating `activity_log` with InnoDB, then restores
+  the original setting. Run STEP 1 in a single connection on each server.
+  A GIPK is a real primary key, but is not explicitly declared in the sample DDL.
+  CDC explicitly copies `my_row_id` from the source rather than generating a
+  separate target identity. `SELECT *` hides it; select `my_row_id` explicitly
+  when comparing source and target.
 
 ## Setup
 
@@ -77,6 +84,7 @@ Execute the SQL file section by section, not all at once.**
    | `orders` | 2 |
    | `product` | 2 |
    | `order_item` | 3 |
+   | `activity_log` | 2 |
 
    Expected key changes include `C002X`, `O1002X`, product ID `202`, and
    order-item key `(1001, 3)`. More expected values are listed in the SQL file.
@@ -89,8 +97,28 @@ Execute the SQL file section by section, not all at once.**
 .\.venv\Scripts\python.exe -m unittest -v test_cdc_sync
 ```
 
-These tests check SQL generation for single/composite PKs and UNIQUE keys,
+These tests check SQL generation for single/composite PKs, GIPKs, and UNIQUE keys,
 key changes, missing keys, and stream table selection without connecting to MySQL.
+They also check checkpoint creation, atomic replacement, retries, and preservation
+of the previous checkpoint when replacement fails.
+
+## Checkpoint Access Errors on Windows
+
+Checkpoint writes use a temporary file followed by atomic replacement. Temporary
+`PermissionError` failures during replacement are retried up to five attempts
+with short backoff and warnings. Persistent failures stop CDC with an error;
+they are not treated as successful checkpoint saves.
+
+If replacement fails, check read-only attributes and Modify permissions on
+[cdc_state.json](cdc_state.json) and its directory, and check for other programs
+holding the file open without delete sharing. Run only one CDC instance per
+checkpoint; replacement retries do not make concurrent instances safe.
+
+The target event is committed before the checkpoint is saved. Keep the existing
+checkpoint and the remaining temporary file for diagnosis; do not delete the
+checkpoint or promote the temporary file blindly. After resolving the access
+problem, restart with the existing checkpoint. Some committed events may replay;
+this demo does not guarantee replay safety for every sequence of key changes.
 
 ## Sample Limitations
 
